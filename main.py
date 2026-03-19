@@ -13,13 +13,14 @@ from aiocryptopay import AioCryptoPay
 
 # --- НАСТРОЙКИ ---
 API_TOKEN = '8717755678:AAFxBTzyDghHPLYOstlvkeNsUjgBStP3KHg'
-CRYPTO_TOKEN = '552977:AAfr4bS9CTvhbqVU9s27CKLM3Ljjr6wrfLF'
+CRYPTO_TOKEN = '553031:AAYPKOXkV5DTYcbIKdQYUlhLFwrI9Ah0YYG' # <-- ТВОЙ НОВЫЙ ТОКЕН
 ADMIN_IDS = [8209617821, 8384467554] 
 DATABASE_URL = 'postgresql://bothost_db_29f14895d3aa:tbdVGmS3JoNrcauznAFgzNTJgefFJE3xE33flLLZY5M@node1.pghost.ru:32854/bothost_db_29f14895d3aa'
 ACC_PRICE = Decimal('0.20') 
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
+# Используем твой токен в основной сети (mainnet)
 crypto = AioCryptoPay(token=CRYPTO_TOKEN, network='mainnet')
 
 class ShopStates(StatesGroup):
@@ -42,7 +43,6 @@ async def get_user_balance(user_id):
         return Decimal('0.00')
     return Decimal(str(val))
 
-# --- ГЛАВНОЕ МЕНЮ ---
 def main_kb(user_id):
     builder = types.ReplyKeyboardMarkup(
         keyboard=[
@@ -59,12 +59,11 @@ def main_kb(user_id):
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
-        "🤖 <b>Магазин запущен.</b>\n\nИспользуйте меню для навигации.",
+        "🤖 <b>Система готова к работе.</b>\n\nВыберите нужное действие в меню ниже:",
         reply_markup=main_kb(message.from_user.id),
         parse_mode="HTML"
     )
 
-# --- ЛОГИКА БАЛАНСА И ОПЛАТЫ ---
 @dp.message(F.text == "💎 Баланс")
 async def balance_menu(message: types.Message):
     balance = await get_user_balance(message.from_user.id)
@@ -79,18 +78,21 @@ async def balance_menu(message: types.Message):
 @dp.callback_query(F.data == "deposit")
 async def deposit_start(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(ShopStates.waiting_for_amount)
-    await callback.message.answer("⌨️ Введите сумму пополнения в <b>USD</b> (например: 0.5):", parse_mode="HTML")
+    await callback.message.answer("⌨️ Введите сумму пополнения в <b>USD</b> (например: 1.0):", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ShopStates.waiting_for_amount)
 async def create_invoice(message: types.Message, state: FSMContext):
     try:
-        amount = float(message.text.replace(',', '.'))
+        # Очистка и проверка ввода
+        amount_input = message.text.replace(',', '.').strip()
+        amount = float(amount_input)
+        
         if amount < 0.1:
-            await message.answer("❌ Минимальная сумма пополнения 0.1 $")
+            await message.answer("❌ Минимальная сумма пополнения — 0.1 $")
             return
 
-        # Генерируем уникальный инвойс (ссылку)
+        # Создание инвойса через CryptoBot
         invoice = await crypto.create_invoice(asset='USDT', amount=amount)
         
         builder = InlineKeyboardBuilder()
@@ -98,38 +100,41 @@ async def create_invoice(message: types.Message, state: FSMContext):
         builder.row(types.InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{invoice.invoice_id}_{amount}"))
         
         await message.answer(
-            f"🚀 <b>Счет на {amount}$ создан!</b>\n\nНажмите кнопку ниже для оплаты. После оплаты нажмите 'Проверить'.",
+            f"🚀 <b>Счет на {amount}$ создан!</b>\n\nОплатите его в CryptoBot и нажмите кнопку проверки.",
             reply_markup=builder.as_markup(),
             parse_mode="HTML"
         )
         await state.clear()
-    except:
-        await message.answer("❌ Ошибка! Введите числовое значение (например: 1.2)")
+    except ValueError:
+        await message.answer("❌ Ошибка! Введите число (например: 0.5 или 2)")
+    except Exception as e:
+        logging.error(f"CryptoPay Error: {e}")
+        await message.answer("❌ Произошла ошибка при создании счета. Попробуйте позже или обратитесь в поддержку.")
 
 @dp.callback_query(F.data.startswith("check_"))
 async def check_pay(callback: types.CallbackQuery):
     _, inv_id, amount = callback.data.split("_")
-    invoices = await crypto.get_invoices(invoice_ids=inv_id)
-    
-    if invoices and invoices[0].status == 'paid':
-        pool = await get_db_pool()
-        await pool.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", Decimal(amount), callback.from_user.id)
-        await callback.message.edit_text(f"✅ Успешно! Баланс пополнен на <b>{amount} $</b>", parse_mode="HTML")
-        
-        # Уведомление админам
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, f"💰 <b>Пополнение!</b>\nЮзер: @{callback.from_user.username}\nСумма: {amount}$")
-            except: pass
-    else:
-        await callback.answer("⚠️ Оплата пока не подтверждена. Попробуйте через минуту.", show_alert=True)
+    try:
+        invoices = await crypto.get_invoices(invoice_ids=inv_id)
+        if invoices and invoices[0].status == 'paid':
+            pool = await get_db_pool()
+            await pool.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", Decimal(amount), callback.from_user.id)
+            await callback.message.edit_text(f"✅ Баланс успешно пополнен на <b>{amount} $</b>!", parse_mode="HTML")
+            
+            for admin_id in ADMIN_IDS:
+                try: await bot.send_message(admin_id, f"💰 <b>Новое пополнение!</b>\nЮзер: @{callback.from_user.username}\nСумма: {amount}$")
+                except: pass
+        else:
+            await callback.answer("⚠️ Оплата не найдена. Сначала оплатите счет в CryptoBot!", show_alert=True)
+    except Exception as e:
+        logging.error(f"Check Pay Error: {e}")
+        await callback.answer("❌ Ошибка при проверке. Попробуйте снова.")
 
-# --- ПОКУПКА И НАЛИЧИЕ ---
 @dp.message(F.text == "📊 Наличие")
 async def stock(message: types.Message):
     pool = await get_db_pool()
     count = await pool.fetchval("SELECT COUNT(*) FROM accounts")
-    await message.answer(f"📦 В наличии: <b>{count} шт.</b> почт.", parse_mode="HTML")
+    await message.answer(f"📦 Сейчас в наличии: <b>{count} шт.</b> почт.", parse_mode="HTML")
 
 @dp.message(F.text == "🛒 Купить аккаунт")
 async def buy(message: types.Message):
@@ -137,7 +142,7 @@ async def buy(message: types.Message):
     balance = await get_user_balance(user_id)
     
     if balance < ACC_PRICE:
-        await message.answer(f"❌ Недостаточно средств. Цена: {ACC_PRICE}$. Пополните баланс.")
+        await message.answer(f"❌ Недостаточно средств.\nЦена почты: {ACC_PRICE}$\nВаш баланс: {balance}$")
         return
 
     pool = await get_db_pool()
@@ -148,13 +153,13 @@ async def buy(message: types.Message):
                 await conn.execute("UPDATE users SET balance = balance - $1 WHERE user_id = $2", ACC_PRICE, user_id)
                 await message.answer(f"✅ <b>Ваш аккаунт:</b>\n<code>{row['data']}</code>", parse_mode="HTML")
             else:
-                await message.answer("❌ Извините, товар закончился.")
+                await message.answer("❌ Товар закончился. Зайдите позже!")
 
 @dp.message(F.text == "➕ Добавить базу")
 async def add_base(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     await state.set_state(ShopStates.adding_accounts)
-    await message.answer("📥 Пришлите список аккаунтов (каждый с новой строки):")
+    await message.answer("📥 Пришлите список почт (каждая с новой строки):")
 
 @dp.message(ShopStates.adding_accounts)
 async def process_add(message: types.Message, state: FSMContext):
@@ -169,11 +174,11 @@ async def process_add(message: types.Message, state: FSMContext):
                 added += 1
             except: pass
     await state.clear()
-    await message.answer(f"✅ Успешно добавлено {added} аккаунтов.")
+    await message.answer(f"✅ Успешно добавлено {added} шт.")
 
 @dp.message(F.text == "🆘 Поддержка")
 async def support(message: types.Message):
-    await message.answer("👨‍💻 По всем вопросам пишите: @ramaz666")
+    await message.answer("👨‍💻 По всем вопросам и проблемам: @ramaz666")
 
 async def main():
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
